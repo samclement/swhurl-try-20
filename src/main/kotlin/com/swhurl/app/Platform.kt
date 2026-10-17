@@ -1,0 +1,194 @@
+package com.swhurl.app
+
+import io.micronaut.context.env.Environment
+import io.micronaut.json.JsonMapper
+import io.micronaut.json.tree.JsonNode
+import io.micronaut.serde.annotation.Serdeable
+import jakarta.inject.Singleton
+import java.math.BigInteger
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.file.Files
+import java.nio.file.Path
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.RSAPublicKeySpec
+import java.time.Duration
+import java.util.Base64
+import org.slf4j.LoggerFactory
+
+// What the swhurl platform gives this app: who is calling it, and how to call the apps it declared.
+// https://github.com/samclement/swhurl-platform/blob/main/docs/apps.md#calling-another-app
+
+/** Who sent a request: type "app" (id: the app's name), "user" (id: their email) or "anonymous". */
+@Serdeable
+data class Caller(val type: String, val id: String?)
+
+/** The request carried a token this app does not accept: answer 401 with the message. */
+class Unauthorized(message: String) : RuntimeException(message)
+
+@Singleton
+class Platform(private val environment: Environment, private val json: JsonMapper) {
+    private val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
+    private val decoder = Base64.getUrlDecoder()
+    private val log = LoggerFactory.getLogger(Platform::class.java)
+
+    // The platform sets these as environment variables (SWHURL_APP ...); tests set the properties.
+    fun setting(variable: String): String? {
+        val property = variable.lowercase().replace('_', '.')
+        val value = System.getenv(variable) ?: environment.getProperty(property, String::class.java).orElse(null)
+        return value?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Who sent this request. A request with a bearer token must carry a good one (Unauthorized
+     * otherwise). Without a token it is a person: signed in when the platform's sign-in put their
+     * email on the request, anonymous otherwise.
+     */
+    fun identify(authorization: String?, email: String?): Caller {
+        if (authorization != null && authorization.startsWith("Bearer ", ignoreCase = true)) {
+            return appCaller(authorization.substring(7).trim())
+        }
+        return if (email.isNullOrBlank()) Caller("anonymous", null) else Caller("user", email)
+    }
+
+    /** For a route only other apps may use: the calling app's name, or Unauthorized. */
+    fun requireApp(caller: Caller): String {
+        if (caller.type != "app" || caller.id == null) {
+            throw Unauthorized("this route is for apps that declare a call to this one")
+        }
+        return caller.id
+    }
+
+    private fun parse(part: String): JsonNode = try {
+        json.readValue(decoder.decode(part), JsonNode::class.java)
+    } catch (problem: Exception) {
+        null
+    } ?: throw Unauthorized("malformed token")
+
+    private fun text(node: JsonNode?): String? = if (node != null && node.isString) node.stringValue else null
+
+    private fun appCaller(token: String): Caller {
+        val app = setting("SWHURL_APP")
+        val env = setting("SWHURL_ENV")
+        val issuer = setting("SWHURL_AUTH_ISSUER")
+        // Outside the platform (local development) there are no keys to check a token against.
+        val keys = setting("SWHURL_AUTH_KEYS")
+            ?: throw Unauthorized("this app is not configured to verify tokens (SWHURL_AUTH_KEYS is not set)")
+        if (app == null || env == null || issuer == null) {
+            throw Unauthorized("this app is not configured to verify tokens (SWHURL_AUTH_KEYS is not set)")
+        }
+        val parts = token.split(".")
+        if (parts.size != 3) throw Unauthorized("malformed token")
+        val header = parse(parts[0])
+        val claims = parse(parts[1])
+        val key = json.readValue(keys.toByteArray(), JsonNode::class.java)?.get("keys")?.values()
+            ?.firstOrNull { text(it.get("kid")) != null && text(it.get("kid")) == text(header.get("kid")) }
+        if (key == null || text(header.get("alg")) != "RS256") throw Unauthorized("token signed by an unknown key")
+        val valid = try {
+            val public = KeyFactory.getInstance("RSA").generatePublic(
+                RSAPublicKeySpec(
+                    BigInteger(1, decoder.decode(text(key.get("n")))),
+                    BigInteger(1, decoder.decode(text(key.get("e")))),
+                ),
+            )
+            Signature.getInstance("SHA256withRSA").run {
+                initVerify(public)
+                update("${parts[0]}.${parts[1]}".toByteArray())
+                verify(decoder.decode(parts[2]))
+            }
+        } catch (problem: Exception) {
+            false
+        }
+        if (!valid) throw Unauthorized("bad token signature")
+        if (text(claims.get("iss")) != issuer) throw Unauthorized("token from another issuer")
+        val audience = claims.get("aud")
+        val audiences = when {
+            audience == null -> emptyList()
+            audience.isArray -> audience.values().mapNotNull { text(it) }
+            else -> listOfNotNull(text(audience))
+        }
+        if (app !in audiences) throw Unauthorized("token is for another app")
+        val expires = claims.get("exp")
+        if (expires == null || !expires.isNumber || expires.longValue * 1000 <= System.currentTimeMillis()) {
+            throw Unauthorized("token expired")
+        }
+        // The caller is the service account <caller> in the namespace <caller>-<this environment>.
+        val subject = Regex("^system:serviceaccount:([a-z0-9-]+):([a-z0-9-]+)$").find(text(claims.get("sub")) ?: "")
+        val caller = subject?.groupValues?.get(2)
+        if (caller == null || subject.groupValues[1] != "$caller-$env") {
+            throw Unauthorized("token is not from an app in this environment")
+        }
+        val allowed = (setting("SWHURL_ALLOWED_CALLERS") ?: "").split(",").filter { it.isNotEmpty() }
+        if (caller !in allowed) throw Unauthorized("$caller is not allowed to call $app")
+        return Caller("app", caller)
+    }
+
+    /**
+     * A secret this app reads: list its name in swhurl.yaml's secrets, and set its value on the
+     * platform. A name listed without a value deploys all the same, so the code that needs it fails
+     * here, saying how to set it.
+     */
+    fun secret(name: String): String =
+        setting(name) ?: throw IllegalStateException(
+            "secret $name has no value: set it on the platform (make app-secret APP=${setting("SWHURL_APP") ?: "<app>"} " +
+                "ENV=${setting("SWHURL_ENV") ?: "<env>"} NAME=$name) and list it in swhurl.yaml's secrets",
+        )
+
+    /**
+     * GET a path of another app this one has been granted a call to on the platform: the same
+     * environment's instance, with this app's token for it. The OpenTelemetry agent adds the trace
+     * headers, so the callee's spans join this request's trace.
+     */
+    fun call(name: String, path: String): HttpResponse<String> {
+        val variable = "SWHURL_SERVICE_${name.uppercase().replace('-', '_')}_URL"
+        val base = System.getenv(variable)
+            ?: environment.getProperty("swhurl.service.$name.url", String::class.java).orElse(null)
+            ?: throw IllegalStateException(
+                "$variable is not set: grant the call on the platform (the app page's Connect to an app, or make app-calls ARGS=\"--add $name\")",
+            )
+        val request = HttpRequest.newBuilder(URI.create(base.trimEnd('/') + path)).timeout(Duration.ofSeconds(10))
+        // The platform replaces the token file every few minutes, so read it for each call. Locally
+        // there is none: point the variable at a stub that does not check tokens.
+        val token = Path.of(setting("SWHURL_TOKENS_DIR") ?: "/var/run/swhurl/tokens", name, "token")
+        if (Files.exists(token)) request.header("Authorization", "Bearer ${Files.readString(token).trim()}")
+        return client.send(request.GET().build(), HttpResponse.BodyHandlers.ofString())
+    }
+
+    /**
+     * Send a message to the notification channel of the team that owns this app
+     * (https://github.com/samclement/swhurl-platform/blob/main/docs/apps.md#notifications). It arrives
+     * titled "<app>/<env>: <title>": the platform takes who sent it from this app's token. `priority`
+     * is "normal" or "high"; `key` makes a repeat harmless (the same key is delivered once); `click`
+     * is an https link opened from the message.
+     *
+     * Returns whether the platform accepted it, and never throws: a notification must not break the
+     * work that sent it. It is not accepted when the app has sent 30 in the last hour, and outside the
+     * platform (SWHURL_NOTIFY_URL is not set) nothing is sent. A team without a channel accepts and
+     * delivers nothing.
+     */
+    fun notify(title: String, message: String = "", priority: String = "normal", click: String = "", key: String = ""): Boolean {
+        val base = setting("SWHURL_NOTIFY_URL") ?: return false
+        try {
+            val fields = mapOf("title" to title, "message" to message, "priority" to priority, "click" to click, "key" to key)
+                .filterValues { it.isNotEmpty() }
+            val request = HttpRequest.newBuilder(URI.create(base.trimEnd('/') + "/v1/notify"))
+                .timeout(Duration.ofSeconds(5))
+                .header("Content-Type", "application/json")
+            // The platform replaces the token file every few minutes, so read it for each call.
+            val token = Path.of(setting("SWHURL_TOKENS_DIR") ?: "/var/run/swhurl/tokens", "notify", "token")
+            if (Files.exists(token)) request.header("Authorization", "Bearer ${Files.readString(token).trim()}")
+            val reply = client.send(
+                request.POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(fields))).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            )
+            if (reply.statusCode() == 202) return true
+            log.warn("notification not sent: the notify service answered ${reply.statusCode()}: ${reply.body().take(200)}")
+        } catch (problem: Exception) {
+            log.warn("notification not sent: ${problem.message ?: problem.javaClass.simpleName}")
+        }
+        return false
+    }
+}

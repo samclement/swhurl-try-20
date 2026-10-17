@@ -1,0 +1,10 @@
+# Written by Copier from samclement/swhurl-app-template-kotlin; `copier update` reads it. Do not edit.
+_commit: v0.2.12-1-g0548683
+_src_path: https://github.com/samclement/swhurl-app-template-kotlin.git
+api: none
+app_name: swhurl-try-20
+database: none
+description: Seed image and auto-merge timing test (throwaway)
+events: none
+flags: none
+kind: web

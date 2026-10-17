@@ -1,0 +1,132 @@
+package com.swhurl.app
+
+import io.micronaut.context.annotation.Value
+import io.micronaut.http.HttpRequest
+import io.micronaut.http.HttpResponse
+import io.micronaut.http.HttpStatus
+import io.micronaut.http.annotation.Controller
+import io.micronaut.http.annotation.Get
+import io.micronaut.http.annotation.PathVariable
+import io.micronaut.http.annotation.Post
+import io.micronaut.http.annotation.RequestFilter
+import io.micronaut.http.annotation.ServerFilter
+import io.micronaut.serde.annotation.Serdeable
+import io.opentelemetry.api.trace.Span
+import org.slf4j.LoggerFactory
+import org.slf4j.MDC
+
+@Serdeable
+data class Health(val ok: Boolean)
+
+@Serdeable
+data class Hello(
+    val message: String,
+    val service: String,
+    val caller: Caller,
+    // How many times it was asked, when the app keeps a database.
+    val visits: Long?,
+)
+
+@Serdeable
+data class Refusal(val error: String)
+
+@Serdeable
+data class Called(val called: String, val status: Int, val reply: String)
+
+@Serdeable
+data class Notified(val sent: Boolean)
+
+private const val CALLER = "swhurl.caller"
+
+// Who is calling, before any route runs: another app (it sent a token the platform issued for this
+// app alone), a signed-in person, or anonymous. A bad token is answered 401 here; see Platform.kt.
+@ServerFilter("/**")
+class CallerFilter(private val platform: Platform) {
+    private val log = LoggerFactory.getLogger(CallerFilter::class.java)
+
+    @RequestFilter
+    fun identify(request: HttpRequest<*>): HttpResponse<*>? {
+        if (request.path == "/healthz") return null
+        return try {
+            val caller = platform.identify(request.headers.get("Authorization"), request.headers.get("X-Auth-Request-Email"))
+            request.setAttribute(CALLER, caller)
+            Span.current().setAttribute("caller.type", caller.type)
+            if (caller.id != null) Span.current().setAttribute("caller.id", caller.id)
+            null
+        } catch (refused: Unauthorized) {
+            log.warn("request refused: ${refused.message}")
+            HttpResponse.status<Refusal>(HttpStatus.UNAUTHORIZED).body(Refusal(refused.message ?: "unauthorized"))
+        }
+    }
+}
+@Controller
+class HttpController(
+    @Value("\${otel.service.name:swhurl-app}") private val serviceName: String,
+    private val platform: Platform,
+    private val events: Events,
+) {
+    private val log = LoggerFactory.getLogger(HttpController::class.java)
+
+    // The platform's readiness and liveness probe: the app answers only once started, and reports not ready until its feature flag overrides have arrived
+    // (at most 5 s; FlagWatcher). Probe requests are not traced.
+    @Get("/healthz")
+    fun health(): HttpResponse<Health> =
+        if (Flags.store.loaded) HttpResponse.ok(Health(true)) else HttpResponse.status<Health>(HttpStatus.SERVICE_UNAVAILABLE).body(Health(false))
+
+    private fun caller(request: HttpRequest<*>): Caller =
+        request.getAttribute(CALLER, Caller::class.java).orElse(Caller("anonymous", null))
+
+    // Every log line of a request names its caller (and, with the agent, its trace).
+    private fun logged(request: HttpRequest<*>, status: Int) {
+        val caller = caller(request)
+        MDC.putCloseable("caller.type", caller.type).use {
+            MDC.putCloseable("caller.id", caller.id ?: "").use {
+                log.info("request handled: ${request.methodName} ${request.path} $status")
+            }
+        }
+    }
+
+    // An example of calling another app: GET /call/orders asks the app "orders" for its "/" and returns
+    // what it said. It works once the platform grants this app the call (make app-calls).
+    @Get("/call/{name}")
+    fun call(@PathVariable name: String, request: HttpRequest<*>): HttpResponse<Called> {
+        val result = try {
+            val reply = platform.call(name, "/")
+            Called(name, reply.statusCode(), reply.body())
+        } catch (problem: Exception) {
+            Called(name, 0, problem.message ?: problem.javaClass.simpleName)
+        }
+        val status = if (result.status in 200..299) HttpStatus.OK else HttpStatus.BAD_GATEWAY
+        logged(request, status.code)
+        return HttpResponse.status<Called>(status).body(result)
+    }
+
+    // An example of notifying the team: POST /notify sends a message to the notification channel of
+    // the team that owns this app, and says whether the platform accepted it.
+    @Post("/notify")
+    fun notifyTeam(request: HttpRequest<*>): Notified {
+        val sent = platform.notify(
+            "Hello from the example route",
+            message = "Asked for by ${caller(request).id ?: "an anonymous caller"}.",
+        )
+        logged(request, HttpStatus.OK.code)
+        return Notified(sent)
+    }
+
+    // The caller is a signed-in person (sign-in happens before requests reach the app), another app, or anonymous.
+    @Get("/")
+    fun hello(request: HttpRequest<*>): Hello {
+        // An example of publishing: the first event this app declares (events.publish in swhurl.yaml)
+        // goes out on every request. Off the platform, or with nothing declared, nothing happens.
+        events.declaredPublishes().firstOrNull()?.let { declared ->
+            try {
+                val caller = caller(request)
+                events.publish(declared, mapOf("path" to "/", "caller" to mapOf("type" to caller.type, "id" to caller.id)))
+            } catch (problem: Exception) {
+                log.error("event not published: $declared: ${problem.message}")
+            }
+        }
+        logged(request, 200)
+        return Hello("hello from $serviceName", serviceName, caller(request), null)
+    }
+}
